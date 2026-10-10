@@ -75,6 +75,9 @@ static rdMatrix34 JonesHud_camViewMatrix = { 0 };
 
 static size_t JonesHud_msecTime = 0;
 static size_t JonesHud_msecDeltaTime = 0;
+
+// Added: Menu/inventory item spin speed in degrees per msec. Original was 16/50 (0.32) which looks too fast with smooth frame timing.
+#define JONESHUD_ITEM_SPINSPEED 0.24f
 static size_t JonesHud_msecGameOverWaitDeltaTime = 0;
 
 // Inventory menu vars
@@ -851,7 +854,7 @@ void J3DAPI JonesHud_Update(const SithWorld* pWorld)
         JonesHud_InitializeGameStatistics();
         bCanvasUpdated = JonesHud_SetCanvasSize(width, height);
     }
-    else if ( curTime <= JonesHud_msecTime )
+    else if ( curTime < JonesHud_msecTime ) // Fixed: Was <=, equal timestamps made delta -1 (i.e. SIZE_MAX) causing spinning menu items to jump to random orientation
     {
         JonesHud_msecDeltaTime = curTime + -1 - JonesHud_msecTime;
     }
@@ -2330,7 +2333,7 @@ void J3DAPI JonesHud_UpdateItem(JonesHudMenuItem* pItem)
             }
             else
             {
-                JonesHud_pCurSelectedMenuItem->pyr.yaw += (float)JonesHud_msecDeltaTime * 16.0f / 50.0f;
+                JonesHud_pCurSelectedMenuItem->pyr.yaw += (float)JonesHud_msecDeltaTime * JONESHUD_ITEM_SPINSPEED; // Changed: Was 16.0f / 50.0f
             }
         }
 
@@ -3532,7 +3535,7 @@ void JonesHud_RenderInventoryItemChange(void)
     // Rotate icon for the duration time
     if ( !JonesHud_HasTimeElapsed(JonesHud_pCurInvChangedItem->msecMoveDuration, JonesHud_pCurInvChangedItem->msecMoveEndTime, JonesHud_msecTime) )
     {
-        JonesHud_pCurInvChangedItem->pyr.yaw += (float)JonesHud_msecDeltaTime * 16.0f / 50.0f;
+        JonesHud_pCurInvChangedItem->pyr.yaw += (float)JonesHud_msecDeltaTime * JONESHUD_ITEM_SPINSPEED; // Changed: Was 16.0f / 50.0f
 
     draw_icon:
         JonesHud_RenderChangedItem(JonesHud_pCurInvChangedItem, 1.0f);

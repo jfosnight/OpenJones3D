@@ -9,6 +9,7 @@ J3D_EXTERN_C_START
 int J3DAPI stdPlatform_InitServices(tHostServices* pHS);
 void J3DAPI stdPlatform_ClearServices(tHostServices* pHS);
 unsigned int stdPlatform_GetTimeMsec(void);
+void stdPlatform_EnablePreciseTimer(bool bEnable); // Added: Sets 1 msec resolution for stdPlatform_GetTimeMsec
 
 J3DNORETURN void J3DAPI stdPlatform_Assert(const char* pErrorStr, const char* pFilename, int linenum);
 int stdPlatform_Printf(const char* format, ...);

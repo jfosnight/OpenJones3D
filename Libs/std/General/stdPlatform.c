@@ -85,6 +85,22 @@ unsigned int stdPlatform_GetTimeMsec(void)
     return timeGetTime(); // TODO: Use more precise timer
 }
 
+void stdPlatform_EnablePreciseTimer(bool bEnable)
+{
+    // Added: By default timeGetTime has ~15.6 msec resolution which at modern frame rates makes many consecutive
+    //        frames report the same time and then a jump, causing stuttering time based animation.
+    static bool bEnabled = false;
+    if ( bEnable && !bEnabled )
+    {
+        bEnabled = timeBeginPeriod(1) == TIMERR_NOERROR;
+    }
+    else if ( !bEnable && bEnabled )
+    {
+        timeEndPeriod(1);
+        bEnabled = false;
+    }
+}
+
 J3DNORETURN void J3DAPI stdPlatform_Assert(const char* pErrorStr, const char* pFilename, int linenum)
 {
     if ( stdPlatform_bAssert )
