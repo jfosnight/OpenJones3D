@@ -51,6 +51,8 @@ void sithControl_RebindJoystick(void); // Added
 
 void sithControl_UnbindMouseAxes(void);
 void sithControl_RebindMouse(void); // Added
+void sithControl_SetMouseLook(bool bEnable, float sensitivity, bool bInvertY); // Added: Sets modern mouse look mode, takes effect on next mouse rebind
+bool sithControl_IsMouseLookEnabled(void); // Added
 
 void sithControl_Reset(void); // Clears all bindings
 

@@ -2,12 +2,14 @@
 #include <j3dcore/j3dhook.h>
 
 #include <sith/Engine/sithCamera.h>
+#include <sith/Engine/sithCollision.h>
 #include <sith/Gameplay/sithPlayer.h>
 #include <sith/Gameplay/sithTime.h>
 #include <sith/RTI/symbols.h>
 #include <sith/World/sithWorld.h>
 
 #include <std/General/stdMath.h>
+#include <std/General/stdPlatform.h>
 #include <std/General/stdUtil.h>
 #include <std/Win95/stdControl.h>
 
@@ -30,6 +32,22 @@ static SithControlCallback aControlCallbacks[32];
 
 static SithControlFunctionFlag aControlFlags[SITHCONTROL_MAXFUNCTIONS];
 static SithControlFunctionBinding aControlBindings[SITHCONTROL_MAXFUNCTIONS];
+
+// Added: Modern mouse look mode. Mouse X drives the analog MOUSETURN axis and mouse Y the PITCH axis,
+//        both of which are read by the original player movement code but were bound only in editor mode.
+static bool  sithControl_bMouseLook           = true;
+static float sithControl_mouseLookSensitivity = 0.05f;
+static bool  sithControl_bMouseLookInvertY    = false;
+
+// Added: Climb assist state for mounting climbable surfaces with jump while walking
+typedef enum eSithControlClimbAssist
+{
+    SITHCONTROL_CLIMBASSIST_NONE     = 0,
+    SITHCONTROL_CLIMBASSIST_STOPPING = 1, // jump held back, waiting for player to stop
+    SITHCONTROL_CLIMBASSIST_JUMPING  = 2, // delivering jump to mount the surface
+} SithControlClimbAssist;
+static SithControlClimbAssist sithControl_climbAssistState = SITHCONTROL_CLIMBASSIST_NONE;
+static uint32_t sithControl_msecClimbAssistStart = 0;
 
 const char* const aFunctionNames[SITHCONTROL_MAXFUNCTIONS + 1] =
 {
@@ -531,6 +549,173 @@ float J3DAPI sithControl_GetAxis(SithControlFunction axisId)
     return value;
 }
 
+// Added: Returns true if the thing faces a climbable surface it can mount.
+//        Mirrors the wall mount check in the original sithPlayerControls_ProcessGeneralMove (0x0042C3F1).
+static bool sithControl_IsClimbSurfaceAhead(SithThing* pThing)
+{
+    const float moveSize = pThing->collide.movesize;
+    sithCollision_SearchForCollisions(pThing->pInSector, pThing, &pThing->pos, &pThing->orient.lvec, 2.0f * moveSize, moveSize, 0xA00);
+
+    bool bFound = false;
+    for ( SithCollision* pCollision = sithCollision_PopStack(); pCollision && !bFound; pCollision = sithCollision_PopStack() )
+    {
+        if ( (pCollision->type & (SITHCOLLISION_WORLD | SITHCOLLISION_ADJOINCROSS)) == 0
+            || !pCollision->pSurfaceCollided
+            || (pCollision->pSurfaceCollided->flags & SITH_SURFACE_CLIMBABLE) == 0 )
+        {
+            continue;
+        }
+
+        // Thing must face the surface, compared in the horizontal plane
+        const rdVector3* pNormal = &pCollision->pSurfaceCollided->face.normal;
+        float nx = -pNormal->x, ny = -pNormal->y;
+        float lx = pThing->orient.lvec.x, ly = pThing->orient.lvec.y;
+        float nlen = sqrtf(nx * nx + ny * ny);
+        float llen = sqrtf(lx * lx + ly * ly);
+        if ( nlen > 0.0f && llen > 0.0f && (nx * lx + ny * ly) / (nlen * llen) > 0.8f )
+        {
+            bFound = true;
+        }
+    }
+
+    sithCollision_DecreaseStackLevel();
+    return bFound;
+}
+
+// Added: Adapts the original key based player controls to the modern (WASD + mouse look) control scheme.
+static int sithControl_ApplyModernControlAssists(SithControlFunction keyId, int value, int* pState)
+{
+    SithThing* pPlayer = sithPlayer_g_pLocalPlayerThing;
+    SithThingMoveStatus moveStatus = pPlayer->moveStatus;
+
+    // Underwater the swim code uses forward/back keys to pitch the player down/up (aircraft style);
+    // report them as pressed from vertical mouse movement so mouse up looks up.
+    // PITCH axis is mouse Y (mouse down -> positive, unless inverted by user setting).
+    const bool bUnderwater = (pPlayer->moveInfo.physics.flags & SITH_PF_ONWATERSURFACE) == 0
+        && pPlayer->pInSector && (pPlayer->pInSector->flags & SITH_SECTOR_UNDERWATER) != 0;
+    if ( (keyId == SITHCONTROL_FORWARD || keyId == SITHCONTROL_BACK) && bUnderwater )
+    {
+        if ( !value )
+        {
+            const float threshold = 2.0f * sithControl_mouseLookSensitivity; // ~2 mouse counts per frame
+            float pitch = sithControl_GetAxis(SITHCONTROL_PITCH);
+            if ( (keyId == SITHCONTROL_FORWARD && pitch > threshold) || (keyId == SITHCONTROL_BACK && pitch < -threshold) )
+            {
+                return 1;
+            }
+        }
+
+        return value;
+    }
+
+    if ( keyId == SITHCONTROL_TURNLEFT || keyId == SITHCONTROL_TURNRIGHT )
+    {
+        if ( value )
+        {
+            return value;
+        }
+
+        // Climbing and ledge hanging use turn keys to move left/right; let the sidestep keys (A/D) do it too
+        if ( moveStatus == SITHPLAYERMOVE_HANGING || moveStatus == SITHPLAYERMOVE_CLIMBIDLE
+            || (moveStatus >= SITHPLAYERMOVE_CLIMBING_UP && moveStatus <= SITHPLAYERMOVE_CLIMBING_RIGHT) )
+        {
+            return sithControl_GetKey(keyId == SITHCONTROL_TURNLEFT ? SITHCONTROL_STPLEFT : SITHCONTROL_STPRIGHT, pState);
+        }
+
+        // Whip and swim move code reads only turn keys and ignores the analog MOUSETURN axis,
+        // so report turn keys as pressed from horizontal mouse movement.
+        // Note, swim condition mirrors sithPlayerControls_Process which calls ProcessSwimMove on water surface
+        //       and in underwater/aetherium sectors (0x0042BD14).
+        bool bWhip = moveStatus == SITHPLAYERMOVE_WHIPSWINGING || moveStatus == SITHPLAYERMOVE_WHIPCLIMBIDLE
+            || moveStatus == SITHPLAYERMOVE_WHIP_CLIMB_START || moveStatus == SITHPLAYERMOVE_WHIP_UNK2;
+        bool bSwim = (pPlayer->moveInfo.physics.flags & SITH_PF_ONWATERSURFACE) != 0
+            || (pPlayer->pInSector && (pPlayer->pInSector->flags & (SITH_SECTOR_UNDERWATER | SITH_SECTOR_AETHERIUM)) != 0);
+        if ( bWhip || bSwim )
+        {
+            // MOUSETURN is bound to inverted mouse X, i.e. positive value means mouse moved left
+            const float threshold = 2.0f * sithControl_mouseLookSensitivity; // ~2 mouse counts per frame
+            float turn = sithControl_GetAxis(SITHCONTROL_MOUSETURN);
+            if ( (keyId == SITHCONTROL_TURNLEFT && turn > threshold) || (keyId == SITHCONTROL_TURNRIGHT && turn < -threshold) )
+            {
+                return 1;
+            }
+        }
+    }
+    else if ( keyId == SITHCONTROL_FORWARD || keyId == SITHCONTROL_RUNFWD )
+    {
+        // Forward + jump is a forward jump, which prevents mounting a ladder/climbable wall while walking into it.
+        // Drop forward while the climb assist is active or when jump is pressed standing in front of a climbable surface.
+        if ( value && (sithControl_climbAssistState != SITHCONTROL_CLIMBASSIST_NONE
+            || (moveStatus == SITHPLAYERMOVE_STILL && sithControl_GetKey(SITHCONTROL_JUMP, NULL) && sithControl_IsClimbSurfaceAhead(pPlayer))) )
+        {
+            if ( pState )
+            {
+                *pState = 0;
+            }
+
+            return 0;
+        }
+    }
+    else if ( keyId == SITHCONTROL_JUMP )
+    {
+        // While walking/running the original code always jumps forward and mounts climbable surfaces only from standing.
+        // So when jump is pressed moving towards a climbable surface, hold the jump back until the player stops, then deliver it.
+        const uint32_t msecNow = stdPlatform_GetTimeMsec();
+        switch ( sithControl_climbAssistState )
+        {
+            case SITHCONTROL_CLIMBASSIST_NONE:
+            {
+                bool bMoving = moveStatus == SITHPLAYERMOVE_WALKING || moveStatus == SITHPLAYERMOVE_RUNNING
+                    || moveStatus == SITHPLAYERMOVE_STAND2WALK || moveStatus == SITHPLAYERMOVE_STAND2RUN || moveStatus == SITHPLAYERMOVE_WALK2STAND;
+                if ( value && bMoving && sithControl_IsClimbSurfaceAhead(pPlayer) )
+                {
+                    sithControl_climbAssistState     = SITHCONTROL_CLIMBASSIST_STOPPING;
+                    sithControl_msecClimbAssistStart = msecNow;
+                    value = 0;
+                }
+            } break;
+
+            case SITHCONTROL_CLIMBASSIST_STOPPING:
+            {
+                value = 0;
+                if ( moveStatus == SITHPLAYERMOVE_STILL )
+                {
+                    sithControl_climbAssistState     = SITHCONTROL_CLIMBASSIST_JUMPING;
+                    sithControl_msecClimbAssistStart = msecNow;
+                }
+                else if ( msecNow - sithControl_msecClimbAssistStart > 1000 )
+                {
+                    sithControl_climbAssistState = SITHCONTROL_CLIMBASSIST_NONE; // Give up
+                }
+            } break;
+
+            case SITHCONTROL_CLIMBASSIST_JUMPING:
+            {
+                // Deliver jump press until the player leaves standing state (mounting) or timeout
+                if ( moveStatus != SITHPLAYERMOVE_STILL || msecNow - sithControl_msecClimbAssistStart > 300 )
+                {
+                    sithControl_climbAssistState = SITHCONTROL_CLIMBASSIST_NONE;
+                }
+                else
+                {
+                    value = 1;
+                    if ( pState )
+                    {
+                        *pState = 1;
+                    }
+                }
+            } break;
+        }
+
+        if ( !value && pState )
+        {
+            *pState = 0;
+        }
+    }
+
+    return value;
+}
+
 int J3DAPI sithControl_GetKey(SithControlFunction keyId, int* pState)
 {
     SITH_ASSERTREL((keyId >= 0) && (keyId < SITHCONTROL_MAXFUNCTIONS));
@@ -557,6 +742,12 @@ int J3DAPI sithControl_GetKey(SithControlFunction keyId, int* pState)
                 value |= stdControl_ReadKey(keyNum, pState);
             }
         }
+    }
+
+    // Added: Modern control assists
+    if ( sithControl_bMouseLook && sithPlayer_g_pLocalPlayerThing )
+    {
+        value = sithControl_ApplyModernControlAssists(keyId, value, pState);
     }
 
     return value;
@@ -663,6 +854,18 @@ void sithControl_RebindMouse(void)
 {
     sithControl_UnbindMouseAxes();
     sithControl_RegisterMouseBindings();
+}
+
+bool sithControl_IsMouseLookEnabled(void)
+{
+    return sithControl_bMouseLook;
+}
+
+void sithControl_SetMouseLook(bool bEnable, float sensitivity, bool bInvertY)
+{
+    sithControl_bMouseLook           = bEnable;
+    sithControl_mouseLookSensitivity = sensitivity;
+    sithControl_bMouseLookInvertY    = bInvertY;
 }
 
 void sithControl_Reset(void)
@@ -858,6 +1061,32 @@ void sithControl_RegisterMouseBindings(void)
 
            //stdControl_SetMouseSensitivity(0.2, 0.2);
             stdControl_EnableMouseSensitivity(0); // Added: Note axis sensitivity best works when mouse sensitivity is disabled here
+        }
+        else if ( sithControl_bMouseLook )
+        {
+            // Added: Modern mouse look bindings.
+            // Note, axis sensitivity works best when std mouse sensitivity is disabled (same as editor mode)
+            stdControl_EnableMouseSensitivity(0);
+
+            SithControlBinding* pBinding = sithControl_BindAxis(SITHCONTROL_MOUSETURN, STDCONTROL_AID_MOUSE_X, SITHCONTROLBIND_AXIS_ENABLED | SITHCONTROLBIND_INVERT_AXIS);
+            if ( pBinding )
+            {
+                pBinding->sensitivity = sithControl_mouseLookSensitivity;
+            }
+
+            SithControlBindFlag pitchFlags = sithControl_bMouseLookInvertY ? (SITHCONTROLBIND_AXIS_ENABLED | SITHCONTROLBIND_INVERT_AXIS) : SITHCONTROLBIND_AXIS_ENABLED;
+            pBinding = sithControl_BindAxis(SITHCONTROL_PITCH, STDCONTROL_AID_MOUSE_Y, pitchFlags);
+            if ( pBinding )
+            {
+                pBinding->sensitivity = sithControl_mouseLookSensitivity;
+            }
+
+            sithControl_BindControl(SITHCONTROL_ACT2, STDCONTROL_KID_MOUSE_LBUTTON, (SithControlBindFlag)0);
+            sithControl_BindControl(SITHCONTROL_FIRE1, STDCONTROL_KID_MOUSE_LBUTTON, (SithControlBindFlag)0);
+            sithControl_BindControl(SITHCONTROL_LOOK, STDCONTROL_KID_MOUSE_RBUTTON, (SithControlBindFlag)0);
+            sithControl_BindControl(SITHCONTROL_WEAPONTOGGLE, STDCONTROL_KID_MOUSE_MBUTTON, (SithControlBindFlag)0);
+            sithControl_BindAxis(SITHCONTROL_NEXTWEAPON, STDCONTROL_AID_MOUSE_Z | STDCONTROL_AID_POSITIVE_AXIS, (SithControlBindFlag)0);
+            sithControl_BindAxis(SITHCONTROL_PREVWEAPON, STDCONTROL_AID_MOUSE_Z | STDCONTROL_AID_NEGATIVE_AXIS, (SithControlBindFlag)0);
         }
         else
         {

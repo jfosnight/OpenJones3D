@@ -40,6 +40,7 @@ SithThing* sithPlayerControls_GetTargetThing(void);
 SithThing* J3DAPI sithPlayerControls_GetVehicleBoardedThing();
 void J3DAPI sithPlayerControls_SetVehicleBoardedThing(SithThing* pThing);
 signed int J3DAPI sithPlayerControls_CanStrafeMove(SithThing* pThing, int bMoveRight);
+bool sithPlayerControls_IsLookMode(void); // Added
 
 // Helper hooking functions
 void sithPlayerControls_InstallHooks(void);

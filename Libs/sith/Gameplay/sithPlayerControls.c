@@ -1,6 +1,7 @@
 #include "sithPlayerControls.h"
 #include <j3dcore/j3dhook.h>
 #include <sith/RTI/symbols.h>
+#include <std/General/stdUtil.h>
 
 #define sithPlayerControls_vecDebugCamDir J3D_DECL_FAR_VAR(sithPlayerControls_vecDebugCamDir, rdVector3)
 #define sithPlayerControls_cameraDistance J3D_DECL_FAR_VAR(sithPlayerControls_cameraDistance, float)
@@ -20,8 +21,71 @@
 #define sithPlayerControls_secSwimmingTime J3D_DECL_FAR_VAR(sithPlayerControls_secSwimmingTime, float)
 #define sithPlayerControls_secCommentWait J3D_DECL_FAR_VAR(sithPlayerControls_secCommentWait, float)
 
+// Added: Enables analog mouse turning (MOUSETURN axis) outside of editor mode.
+//        The original move functions apply MOUSETURN only when SITHDEBUG_INEDITOR is set:
+//            mov eax, [sithMain_g_sith_mode.debugModeFlags]; test ah, 1; je skip; push SITHCONTROL_MOUSETURN; call sithControl_GetAxis
+//        This patches out the conditional jump at each site. When no mouse axis is bound, MOUSETURN reads 0 so the patch is a no-op.
+//        TODO: Remove when sithPlayerControls functions are implemented.
+static void sithPlayerControls_EnableMouseTurn(void)
+{
+    // Note, the gate in ProcessLookControls (0x0042C170) is intentionally not patched:
+    //       there MOUSETURN accumulates into the actor's angular velocity which isn't damped in look mode
+    //       resulting in uncontrollable spinning. Mouse look view is handled in JonesControl instead.
+    static const uintptr_t aGateAddrs[] = {
+        0x0042CC28, // ProcessGeneralMove
+        0x0042D3B9, // ProcessGeneralMove
+        0x0042D73F, // ProcessGeneralMove
+        0x0042DA45, // ProcessGeneralMove, je near to function epilogue; fallthrough block ends with the same epilogue
+        0x0042FBB6, // ProcessJumpForwardMove
+    };
+
+    for ( size_t i = 0; i < STD_ARRAYLEN(aGateAddrs); ++i )
+    {
+        uint8_t* pGate = (uint8_t*)aGateAddrs[i];
+        if ( pGate[0] != 0xF6 || pGate[1] != 0xC4 || pGate[2] != 0x01 ) // test ah, 1
+        {
+            continue;
+        }
+
+        size_t jmpSize = 0;
+        if ( pGate[3] == 0x74 && pGate[5] == 0x6A && pGate[6] == SITHCONTROL_MOUSETURN ) // je short; push MOUSETURN
+        {
+            jmpSize = 2;
+        }
+        else if ( pGate[3] == 0x0F && pGate[4] == 0x84 && pGate[9] == 0x6A && pGate[10] == SITHCONTROL_MOUSETURN ) // je near; push MOUSETURN
+        {
+            jmpSize = 6;
+        }
+
+        if ( jmpSize )
+        {
+            DWORD oldProtect;
+            VirtualProtect(pGate + 3, jmpSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+            memset(pGate + 3, 0x90, jmpSize); // nop
+            VirtualProtect(pGate + 3, jmpSize, oldProtect, &oldProtect);
+        }
+    }
+
+    // ProcessFlyAndUnderwaterMove (SITH_PF_FLY mode, e.g. jewel flying; swimming is handled by ProcessSwimMove which reads only turn keys,
+    // see sithControl modern control assists): editor gate is followed by an extra check that no key turn is active:
+    //     test ah, 1; je skip; fld [esi+2A0h] (angular velocity); fcomp 0.0; ...; push SITHCONTROL_MOUSETURN
+    uint8_t* pUnderwaterGate = (uint8_t*)0x0042F21F;
+    static const uint8_t aUnderwaterGateBytes[] = { 0xF6, 0xC4, 0x01, 0x74, 0x45, 0xD9, 0x86, 0xA0, 0x02, 0x00, 0x00 };
+    if ( memcmp(pUnderwaterGate, aUnderwaterGateBytes, sizeof(aUnderwaterGateBytes)) == 0 && pUnderwaterGate[0x18] == 0x6A && pUnderwaterGate[0x19] == SITHCONTROL_MOUSETURN )
+    {
+        DWORD oldProtect;
+        VirtualProtect(pUnderwaterGate + 3, 2, PAGE_EXECUTE_READWRITE, &oldProtect);
+        memset(pUnderwaterGate + 3, 0x90, 2); // nop
+        VirtualProtect(pUnderwaterGate + 3, 2, oldProtect, &oldProtect);
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+}
+
 void sithPlayerControls_InstallHooks(void)
 {
+    sithPlayerControls_EnableMouseTurn(); // Added
+
     // Uncomment only lines for functions that have full definition and doesn't call original function (non-thunk functions)
 
     // J3D_HOOKFUNC(sithPlayerControls_PuppetCallback);
@@ -52,6 +116,11 @@ void sithPlayerControls_InstallHooks(void)
     // J3D_HOOKFUNC(sithPlayerControls_GetVehicleBoardedThing);
     // J3D_HOOKFUNC(sithPlayerControls_SetVehicleBoardedThing);
     // J3D_HOOKFUNC(sithPlayerControls_CanStrafeMove);
+}
+
+bool sithPlayerControls_IsLookMode(void)
+{
+    return sithPlayerControls_bLookMode != 0;
 }
 
 void sithPlayerControls_ResetGlobals(void)
