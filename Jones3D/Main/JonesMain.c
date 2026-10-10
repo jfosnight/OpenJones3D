@@ -255,6 +255,8 @@ int J3DAPI JonesMain_Startup(const char* lpCmdLine)
     JonesMain_bPrintQuickSave = false;
     JonesMain_curLevelNum     = 0;
 
+    stdPlatform_EnablePreciseTimer(true); // Added
+
     memset(&JonesMain_circBuf, 0, sizeof(JonesMain_circBuf));
     memset(JonesMain_aToggleMenuKeyIds, 0, sizeof(JonesMain_aToggleMenuKeyIds)); // Fixed: Fixed the size
 
@@ -276,7 +278,8 @@ int J3DAPI JonesMain_Startup(const char* lpCmdLine)
     JonesDisplay_UpdateDualScreenWindowSize(&JonesMain_state.displaySettings);
     JonesFile_Startup(&JonesMain_hs);
 
-    if ( wuRegistry_Startup(HKEY_LOCAL_MACHINE, "Software\\LucasArts Entertainment Company LLC\\Indiana Jones and the Infernal Machine\\v1.0") )
+    // Changed: Use HKEY_CURRENT_USER instead of HKEY_LOCAL_MACHINE so settings are writable without admin rights
+    if ( wuRegistry_Startup(HKEY_CURRENT_USER, "Software\\LucasArts Entertainment Company LLC\\Indiana Jones and the Infernal Machine\\v1.0") )
     {
         JonesMain_LogErrorToFile("Couldn't open the registry.");
         JonesMain_CloseWindow();
@@ -344,6 +347,26 @@ int J3DAPI JonesMain_Startup(const char* lpCmdLine)
     Sound_SetMaxVolume(JonesMain_state.soundSettings.maxSoundVolume);
     SmushPlay_SetGlobalVolume((size_t)(JonesMain_state.soundSettings.maxSoundVolume * 127.0f)); // TODO: Can be removed as it's being set in PlayIntroMovie
 
+    // Added: Command line start options which skip the intro and the new game start level:
+    //        -continue  loads the last saved game (falls back to -load when there is none)
+    //        -load      opens the load game dialog
+    bool bContinueGame = false;
+    if ( lpCmdLine && strstr(lpCmdLine, "-continue") )
+    {
+        wuRegistry_GetStr("Last Save Game", JonesMain_aNdsFilename, STD_ARRAYLEN(JonesMain_aNdsFilename), "");
+        bContinueGame = strlen(JonesMain_aNdsFilename) && stdFileUtil_FileExists(JonesMain_aNdsFilename);
+        if ( !bContinueGame )
+        {
+            memset(JonesMain_aNdsFilename, 0, sizeof(JonesMain_aNdsFilename));
+        }
+
+        JonesMain_state.startMode = JONES_STARTMODE_LOADGAME;
+    }
+    else if ( lpCmdLine && strstr(lpCmdLine, "-load") )
+    {
+        JonesMain_state.startMode = JONES_STARTMODE_LOADGAME;
+    }
+
     // Handle start mode
     int bSuccess    = 0;
     bool bPlayIntro = true;
@@ -364,7 +387,7 @@ int J3DAPI JonesMain_Startup(const char* lpCmdLine)
 
         case JONES_STARTMODE_LOADGAME:
         {
-            if ( jonesConfig_GetLoadGameFilePath(stdWin95_GetWindow(), JonesMain_aNdsFilename) != 1 )
+            if ( !bContinueGame && jonesConfig_GetLoadGameFilePath(stdWin95_GetWindow(), JonesMain_aNdsFilename) != 1 ) // Changed: Skip dialog when continuing last saved game
             {
                 return 1;
             }
@@ -1102,6 +1125,7 @@ void JonesMain_Shutdown(void)
     JonesConsole_Close();
 
     JonesDisplay_Shutdown();
+    stdPlatform_EnablePreciseTimer(false); // Added
     JonesDisplay_CloseLoadScreen();
 
     JonesHud_Shutdown();
@@ -2624,7 +2648,7 @@ void J3DAPI JonesMain_LoadSettings(StdDisplayEnvironment* pDisplayEnv, JonesStat
     sithRender_g_fogDensity = pConfig->displaySettings.fogDensity * 100.0f;
 
     pConfig->bDevMode  = wuRegistry_GetIntEx("DevMode", 0);
-    pConfig->startMode = wuRegistry_GetInt("Start Mode", JONES_STARTMODE_DEVELOPERDIALOG);
+    pConfig->startMode = wuRegistry_GetInt("Start Mode", JONES_STARTMODE_STARTGAME); // Changed: Default to start game, was JONES_STARTMODE_DEVELOPERDIALOG which can't start a retail game without settings
     pConfig->startMode = STDMATH_CLAMP(pConfig->startMode, JONES_STARTMODE_STARTGAME, JONES_STARTMODE_DISPLAYSETTINGS);
 
     pConfig->outputMode = wuRegistry_GetInt("Debug Mode", JONES_OUTPUTMODE_NONE);

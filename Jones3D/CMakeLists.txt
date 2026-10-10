@@ -35,6 +35,9 @@ set_property(TARGET Jones3D PROPERTY VS_DPI_AWARE "PerMonitor")
 # Rename the DLL target output
 set_target_properties(Jones3D_DLL PROPERTIES OUTPUT_NAME "Jones3D")
 
+# Give the EXE its own PDB so it doesn't overwrite Jones3D.pdb of the DLL (LNK1209 on relink)
+set_target_properties(Jones3D PROPERTIES PDB_NAME "Jones3D_exe")
+
 # Add include to Jones3D.dll
 target_include_directories(Jones3D_DLL PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 

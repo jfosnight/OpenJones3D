@@ -49,18 +49,25 @@ int wmain(int argc, wchar_t* argv[])
     // Execute Indy3D.exe in suspended mode.
     fs::path exePath = "Indy3D.exe";
     std::wstring args;
-    if ( argc > 1 )
+
+    // First argument is optional path to Indy3D.exe, arguments starting with '-' are passed to the game (e.g.: -continue, -load)
+    int firstArg = 1;
+    bool bExePathArg = argc > 1 && argv[1][0] != L'-';
+    if ( bExePathArg )
     {
-        exePath = argv[1]; // should be path to Indy3D.exe
-        std::wstringstream sargs;
-        for ( int i = 2; i < argc; ++i )
-        {
-            if ( i > 2 ) sargs << L" ";
-            sargs << argv[i];
-        }
-        args = sargs.str();
+        exePath  = argv[1];
+        firstArg = 2;
     }
-    else if ( !fs::exists(exePath) )
+
+    std::wstringstream sargs;
+    for ( int i = firstArg; i < argc; ++i )
+    {
+        if ( i > firstArg ) sargs << L" ";
+        sargs << argv[i];
+    }
+    args = sargs.str();
+
+    if ( !bExePathArg && !fs::exists(exePath) )
     {
         // Try locating exe in resource folder
         exePath = "Resource/Indy3D.exe";
