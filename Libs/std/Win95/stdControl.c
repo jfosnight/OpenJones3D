@@ -16,6 +16,7 @@ static bool stdControl_bStartup = false;
 static bool stdControl_bOpen    = false;
 
 static LPDIRECTINPUTA stdControl_pDI = NULL;
+static bool stdControl_bDInput8      = false; // Added: true when stdControl_pDI is a DirectInput 8 object
 
 static bool stdControl_bReadMouse               = true;
 static POINT stdControl_mousePos                = { 0, 0 };
@@ -146,6 +147,60 @@ void stdControl_InstallHooks(void)
 void stdControl_ResetGlobals(void)
 {}
 
+// Added: Prefer DirectInput 8 over the legacy DirectInput (dinput.dll).
+//        On modern Windows the legacy dinput.dll can overflow a heap buffer while enumerating HID devices
+//        in IDirectInput::EnumDevices, corrupting the process heap and crashing the game at random later.
+//        IDirectInput8A and IDirectInputDevice8A share the vtable layout of IDirectInputA and IDirectInputDevice2A
+//        for all methods used here, so DI8 objects are used through the legacy interface types.
+static HRESULT stdControl_CreateDirectInput(HINSTANCE hInstance)
+{
+    typedef HRESULT(WINAPI* DirectInput8CreateFunc)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    static const GUID IID_IDirectInput8A_ = { 0xBF798030, 0x483A, 0x4DA2, { 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
+
+    HMODULE hDInput8 = LoadLibraryA("dinput8.dll");
+    if ( hDInput8 )
+    {
+        DirectInput8CreateFunc pfDirectInput8Create = (DirectInput8CreateFunc)GetProcAddress(hDInput8, "DirectInput8Create");
+        if ( pfDirectInput8Create && SUCCEEDED(pfDirectInput8Create(hInstance, 0x0800, &IID_IDirectInput8A_, (LPVOID*)&stdControl_pDI, NULL)) )
+        {
+            stdControl_bDInput8 = true;
+            return DI_OK; // Note, dinput8.dll is kept loaded for the lifetime of the process
+        }
+
+        FreeLibrary(hDInput8);
+    }
+
+    STDLOG_STATUS("DirectInput 8 unavailable, falling back to legacy DirectInput.\n");
+    stdControl_bDInput8 = false;
+    return DirectInputCreate(hInstance, DIRECTINPUT_VERSION, &stdControl_pDI, NULL);
+}
+
+// Added: Translates DirectInput 8 device type to legacy device type and forwards to stdControl_EnumDevicesCallback
+static BOOL CALLBACK stdControl_EnumDevices8Callback(LPCDIDEVICEINSTANCEA pdidInstance, LPVOID pContext)
+{
+    // DI8DEVTYPE_* values from DirectInput 8
+    enum { DI8_MOUSE = 0x12, DI8_KEYBOARD = 0x13, DI8_JOYSTICK = 0x14, DI8_GAMEPAD = 0x15, DI8_DRIVING = 0x16, DI8_FLIGHT = 0x17, DI8_1STPERSON = 0x18 };
+
+    DIDEVICEINSTANCEA instance;
+    memcpy(&instance, pdidInstance, sizeof(instance));
+
+    DWORD type = GET_DIDEVICE_TYPE(pdidInstance->dwDevType);
+    switch ( type )
+    {
+        case DI8_MOUSE:     instance.dwDevType = DIDEVTYPE_MOUSE; break;
+        case DI8_KEYBOARD:  instance.dwDevType = DIDEVTYPE_KEYBOARD; break;
+        case DI8_JOYSTICK:  instance.dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_TRADITIONAL << 8); break;
+        case DI8_GAMEPAD:   instance.dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8); break;
+        case DI8_DRIVING:   instance.dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_WHEEL << 8); break;
+        case DI8_FLIGHT:    instance.dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_FLIGHTSTICK << 8); break;
+        case DI8_1STPERSON: instance.dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_UNKNOWN << 8); break;
+        default:            instance.dwDevType = DIDEVTYPE_DEVICE; break;
+    }
+
+    instance.dwDevType |= pdidInstance->dwDevType & DIDEVTYPE_HID;
+    return stdControl_EnumDevicesCallback(&instance, pContext);
+}
+
 int J3DAPI stdControl_Startup(int bKeyboardForeground)
 {
     if ( stdControl_bStartup )
@@ -169,13 +224,13 @@ int J3DAPI stdControl_Startup(int bKeyboardForeground)
     memset(stdControl_aJoystickDevices, 0, sizeof(stdControl_aJoystickDevices));
 
     HINSTANCE hInstance = stdWin95_GetInstance();
-    HRESULT hres = DirectInputCreate(hInstance, DIRECTINPUT_VERSION, &stdControl_pDI, NULL);
+    HRESULT hres = stdControl_CreateDirectInput(hInstance); // Changed: Prefer DirectInput 8, was DirectInputCreate
     if ( hres != DI_OK )
     {
         STDLOG_ERROR("DirectInputCreate returned %s.\n", stdControl_DIGetStatus(hres));
         return 1;
     }
-    else if ( IDirectInput_EnumDevices(stdControl_pDI, 0U, stdControl_EnumDevicesCallback, NULL, DIEDFL_ATTACHEDONLY) != DI_OK )
+    else if ( IDirectInput_EnumDevices(stdControl_pDI, 0U, stdControl_bDInput8 ? stdControl_EnumDevices8Callback : stdControl_EnumDevicesCallback, NULL, DIEDFL_ATTACHEDONLY) != DI_OK )
     {
         STDLOG_ERROR("Could not create DInput Joystick device.\n");
         return 1;
@@ -452,7 +507,7 @@ float J3DAPI stdControl_ReadKeyAsAxis(size_t keyId)
 
 int J3DAPI stdControl_ReadAxisAsKey(size_t axis, int* pbPressed)
 {
-    if ( (axis & STDCONTROL_AID_LOW_SENSITIVITY) == 0 || (stdControl_aAxes[axis].flags & STDCONTROL_AXIS_GAMEPAD) != 0 )
+    if ( (axis & STDCONTROL_AID_LOW_SENSITIVITY) == 0 || (STDCONTROL_GETAID(axis) < STDCONTROL_MAX_AXES && (stdControl_aAxes[STDCONTROL_GETAID(axis)].flags & STDCONTROL_AXIS_GAMEPAD) != 0) ) // Fixed: Index axes array with axis id stripped of flag bits
     {
         return stdControl_ReadAxisAsKeyEx(axis, pbPressed, 0.25f);
     }
@@ -743,17 +798,28 @@ void stdControl_InitJoysticks(void)
     for ( size_t joyNum = 0; joyNum < stdControl_numJoystickDevices; ++joyNum )
     {
         LPDIRECTINPUTDEVICEA lpd = NULL;
-        if FAILED(IDirectInput_CreateDevice(stdControl_pDI, &stdControl_aJoystickDevices[joyNum].dinstance.guidInstance, &lpd, 0))
-        {
-            STDLOG_ERROR("Could not create DInput Joystick device.\n");
-        }
-
-        int hres = IDirectInputDevice_QueryInterface(lpd, &IID_IDirectInputDevice2A, (LPVOID*)&stdControl_aJoystickDevices[joyNum].pDIDevice);
-        IDirectInputDevice_Release(lpd);
-
+        int hres = IDirectInput_CreateDevice(stdControl_pDI, &stdControl_aJoystickDevices[joyNum].dinstance.guidInstance, &lpd, 0);
         if FAILED(hres)
         {
-            goto error;
+            STDLOG_ERROR("Could not create DInput Joystick device.\n");
+            goto error; // Fixed: Bail out instead of calling QueryInterface on NULL device
+        }
+
+        if ( stdControl_bDInput8 )
+        {
+            // Added: IDirectInputDevice8A doesn't expose legacy interfaces via QueryInterface,
+            //        but its vtable is compatible with IDirectInputDevice2A
+            stdControl_aJoystickDevices[joyNum].pDIDevice = (LPDIRECTINPUTDEVICE2A)lpd;
+        }
+        else
+        {
+            hres = IDirectInputDevice_QueryInterface(lpd, &IID_IDirectInputDevice2A, (LPVOID*)&stdControl_aJoystickDevices[joyNum].pDIDevice);
+            IDirectInputDevice_Release(lpd);
+
+            if FAILED(hres)
+            {
+                goto error;
+            }
         }
 
         stdControl_aJoystickDevices[joyNum].caps.dwSize = sizeof(DIDEVCAPS);
@@ -1089,7 +1155,19 @@ void stdControl_ReadJoysticks(void)
 
 void stdControl_ReadMouse(void)
 {
-    DIDEVICEOBJECTDATA aMouseBuffer[STDCONTROL_MOUSE_BUFFERSIZE] = { 0 }; // Added: Init to 0
+    // Added: DirectInput 8 requires the DX8 DIDEVICEOBJECTDATA which has extra uAppData field at the end.
+    //        The buffer is sized for the DX8 struct and the stride is selected based on the DirectInput version used.
+    typedef struct sStdDIDeviceObjectData8
+    {
+        DWORD dwOfs;
+        DWORD dwData;
+        DWORD dwTimeStamp;
+        DWORD dwSequence;
+        UINT_PTR uAppData;
+    } StdDIDeviceObjectData8;
+
+    StdDIDeviceObjectData8 aMouseBuffer[STDCONTROL_MOUSE_BUFFERSIZE] = { 0 }; // Added: Init to 0
+    const DWORD cbObjectData = stdControl_bDInput8 ? sizeof(StdDIDeviceObjectData8) : sizeof(DIDEVICEOBJECTDATA);
     if ( !stdControl_bReadMouse || !stdControl_mouse.pDIDevice )
     {
         return;
@@ -1140,7 +1218,7 @@ void stdControl_ReadMouse(void)
     }
 
     DWORD bufferSize = STDCONTROL_MOUSE_BUFFERSIZE;
-    hr = IDirectInputDevice_GetDeviceData(stdControl_mouse.pDIDevice, sizeof(DIDEVICEOBJECTDATA), aMouseBuffer, &bufferSize, 0);
+    hr = IDirectInputDevice_GetDeviceData(stdControl_mouse.pDIDevice, cbObjectData, (LPDIDEVICEOBJECTDATA)aMouseBuffer, &bufferSize, 0);
     if ( hr != DI_OK )
     {
         if ( hr == DI_BUFFEROVERFLOW )
@@ -1163,7 +1241,7 @@ void stdControl_ReadMouse(void)
     {
         for ( size_t i = 0; i < bufferSize; i++ )
         {
-            DIDEVICEOBJECTDATA* pData = &aMouseBuffer[i];
+            const DIDEVICEOBJECTDATA* pData = (const DIDEVICEOBJECTDATA*)((const uint8_t*)aMouseBuffer + i * cbObjectData);
             if ( pData->dwOfs >= DIMOFS_BUTTON0 && pData->dwOfs <= DIMOFS_BUTTON3 )// IF 12 - DIMOFS_BUTTON0 ... 15 - DIMOFS_BUTTON3
             {
                 static_assert((STDCONTROL_KID_MOUSE_LBUTTON - DIMOFS_BUTTON0) == 628, "(STDCONTROL_KID_MOUSE_LBUTTON - DIMOFS_BUTTON0) == 628");
@@ -1215,7 +1293,7 @@ BOOL CALLBACK stdControl_EnumDevicesCallback(LPCDIDEVICEINSTANCEA pdidInstance, 
 {
     J3D_UNUSED(pContext);
 
-    DWORD dwDevType = pdidInstance->dwDevType;
+    DWORD dwDevType = GET_DIDEVICE_TYPE(pdidInstance->dwDevType); // Fixed: Compare only device type (low byte) as original does; subtype bits made joysticks never match
     if ( dwDevType == DIDEVTYPE_MOUSE )
     {
         STDLOG_STATUS("Mouse:%s:%s\n", pdidInstance->tszProductName, pdidInstance->tszInstanceName);
